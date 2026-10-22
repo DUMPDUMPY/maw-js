@@ -1,7 +1,47 @@
 import { Elysia} from "elysia";
-import { closeSync, openSync, readSync, readdirSync, readFileSync, statSync } from "fs";
+import { readdir, stat } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+
+// A session transcript is streamed line-by-line rather than read whole: some
+// real transcripts are 500MB+, so readFile + split("\n") would allocate ~1GB
+// and block the event loop in one shot. Streaming keeps memory bounded (to the
+// longest single line) and lets the scan yield between chunks.
+type ReadLinesAsync = (path: string) => AsyncIterable<string>;
+type ReaddirAsync = (path: string) => Promise<string[]>;
+type StatAsync = (path: string) => Promise<{ isDirectory: () => boolean; mtimeMs?: number; size?: number }>;
+
+/** Default line reader: stream a file and split into lines without buffering it whole. */
+async function* streamLines(path: string): AsyncIterable<string> {
+  const decoder = new TextDecoder();
+  let buf = "";
+  // @ts-ignore Bun global
+  for await (const chunk of Bun.file(path).stream()) {
+    buf += decoder.decode(chunk as Uint8Array, { stream: true });
+    // Split off complete lines in one pass (O(n)); keep the trailing partial.
+    const parts = buf.split("\n");
+    buf = parts.pop() ?? "";
+    for (const line of parts) yield line;
+  }
+  buf += decoder.decode();
+  if (buf) yield buf;
+}
+
+// Tiny concurrency pool (no new dependency): reads/parses session files
+// concurrently but bounded, so a costs scan never monopolizes the event loop.
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
 
 // Cost per million tokens (USD)
 const COST_PER_MTOK: Record<string, { input: number; output: number }> = {
@@ -76,172 +116,99 @@ function makeBuckets(n: number): string[] {
 
 export interface CostsApiDeps {
   projectsDir: string;
-  readdirSync: typeof readdirSync;
-  readFileSync: typeof readFileSync;
-  statSync: typeof statSync;
+  readdir: ReaddirAsync;
+  readLines: ReadLinesAsync;
+  stat: StatAsync;
   join: typeof join;
-  /** Read bytes [start, end) of a file. Defaults to a real fs range read. */
-  readRange?: (filePath: string, start: number, end: number) => Buffer;
 }
 
-/** One parsed session file, kept warm across polls. */
-interface FileCacheEntry {
-  mtimeMs: number;
-  size: number;
-  /** Bytes already folded into `acc`; always ends on a line boundary. */
-  offset: number;
-  acc: SessionUsage;
-  usage: SessionUsage | null;
-}
+interface ScannedFile { agentName: string; usage: SessionUsage }
 
-/** Session JSONL files must stay under this many warm entries. */
-const FILE_CACHE_LIMIT = 4096;
-
-function emptyUsage(): SessionUsage {
-  return {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheCreateTokens: 0,
-    turns: 0,
-    model: "",
-    lastTimestamp: "",
-  };
-}
-
-/** Aggregate an already-parsed file. `null` when the file holds no assistant turns. */
-function toUsage(acc: SessionUsage): SessionUsage | null {
-  return acc.turns > 0 ? { ...acc } : null;
-}
-
-function defaultReadRange(filePath: string, start: number, end: number): Buffer {
-  const length = end - start;
-  if (length <= 0) return Buffer.alloc(0);
-  const fd = openSync(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(length);
-    let filled = 0;
-    while (filled < length) {
-      const read = readSync(fd, buffer, filled, length - filled, start + filled);
-      if (read <= 0) break;
-      filled += read;
-    }
-    return filled === length ? buffer : buffer.subarray(0, filled);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/** Split a chunk into the complete trailing lines plus the bytes they occupy. */
-function completeLines(chunk: Buffer): { text: string; consumed: number } {
-  const lastNewline = chunk.lastIndexOf(0x0a);
-  if (lastNewline < 0) return { text: "", consumed: 0 };
-  return { text: chunk.subarray(0, lastNewline + 1).toString("utf-8"), consumed: lastNewline + 1 };
-}
-
-function accumulateUsage(content: string, acc: SessionUsage): void {
-  for (const line of content.split("\n")) {
-    if (!line) continue;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { continue; }
-    if (obj.type !== "assistant" || !obj.message?.usage) continue;
-
-    const u = obj.message.usage;
-    acc.inputTokens += u.input_tokens || 0;
-    acc.outputTokens += u.output_tokens || 0;
-    acc.cacheReadTokens += u.cache_read_input_tokens || 0;
-    acc.cacheCreateTokens += u.cache_creation_input_tokens || 0;
-    acc.turns++;
-
-    if (obj.message.model && !acc.model) acc.model = obj.message.model;
-    if (obj.timestamp) acc.lastTimestamp = obj.timestamp;
-  }
-}
+const SCAN_TTL_MS = 30_000;
 
 export function createCostsApi(deps: CostsApiDeps = {
   projectsDir: join(homedir(), ".claude", "projects"),
-  readdirSync,
-  readFileSync,
-  statSync,
+  readdir: (path) => readdir(path),
+  readLines: streamLines,
+  stat: (path) => stat(path),
   join,
 }) {
-  const readRange = deps.readRange ?? defaultReadRange;
-  // Warm-scan cache. Session JSONL files are append-only and can pass 250 MB,
-  // so re-reading all of them on every /costs poll blocked the serve event loop
-  // for seconds. Each entry stores the parsed totals plus the byte offset
-  // already consumed; a poll then only parses newly appended lines.
-  const fileCache = new Map<string, FileCacheEntry>();
+  // Per-instance cache so /costs and /costs/daily share a single async scan and
+  // frequent dashboard polls don't re-read every ~/.claude/projects/*.jsonl.
+  // Scoped to the factory (not module) so injected test apps never cross-talk.
+  let scanCache: { data: ScannedFile[]; ts: number } | null = null;
 
-  function storeEntry(
-    filePath: string,
-    mtimeMs: number,
-    size: number,
-    offset: number,
-    acc: SessionUsage,
-  ): SessionUsage | null {
-    const usage = toUsage(acc);
-    if (fileCache.size >= FILE_CACHE_LIMIT) fileCache.clear();
-    fileCache.set(filePath, { mtimeMs, size, offset, acc, usage });
-    return usage;
-  }
+  // Per-file usage cache keyed by (mtimeMs, size). jsonl transcripts are
+  // append-only and some are 500MB+; without this a cold scan would re-read
+  // gigabytes every time. A file is read once, then skipped until it changes.
+  // (When stat lacks mtime/size — e.g. injected test stubs — caching is off.)
+  const fileCache = new Map<string, { mtimeMs: number; size: number; usage: SessionUsage | null }>();
 
-  function scanSessionFresh(filePath: string, mtimeMs?: number, size?: number): SessionUsage | null {
-    let content: string;
+  async function scanSessionWithDeps(filePath: string): Promise<SessionUsage | null> {
     try {
-      content = String(deps.readFileSync(filePath, "utf-8"));
+      return await scanSessionContent(deps.readLines(filePath));
     } catch {
       return null;
     }
-    const acc = emptyUsage();
-    accumulateUsage(content, acc);
-    // No usable stat identity (test doubles) — parse fresh, never cache.
-    if (mtimeMs === undefined || size === undefined) return toUsage(acc);
-
-    const tail = content.slice(content.lastIndexOf("\n") + 1);
-    const offset = size - Buffer.byteLength(tail, "utf-8");
-    return storeEntry(filePath, mtimeMs, size, offset, acc);
   }
 
-  function scanSessionWithDeps(filePath: string): SessionUsage | null {
-    let stat: { size?: number; mtimeMs?: number };
+  async function projectDirs(set: { status?: number }): Promise<string[] | null> {
     try {
-      stat = deps.statSync(filePath) as unknown as { size?: number; mtimeMs?: number };
-    } catch {
-      return null;
-    }
-    const size = Number(stat?.size);
-    const mtimeMs = Number(stat?.mtimeMs);
-    if (!Number.isFinite(size) || !Number.isFinite(mtimeMs)) return scanSessionFresh(filePath);
-
-    const cached = fileCache.get(filePath);
-    if (cached && cached.size === size && cached.mtimeMs === mtimeMs) return cached.usage;
-
-    // Append-only fast path: parse just the new tail of a file we already read.
-    if (cached && size > cached.offset) {
-      try {
-        const { text, consumed } = completeLines(readRange(filePath, cached.offset, size));
-        const acc = { ...cached.acc };
-        accumulateUsage(text, acc);
-        return storeEntry(filePath, mtimeMs, size, cached.offset + consumed, acc);
-      } catch { /* fall back to a full read below */ }
-    }
-    return scanSessionFresh(filePath, mtimeMs, size);
-  }
-
-  function projectDirs(set: { status?: number }) {
-    try {
-      return deps.readdirSync(deps.projectsDir).filter((d) => {
-        try { return deps.statSync(deps.join(deps.projectsDir, d)).isDirectory(); } catch { return false; }
-      });
+      const all = await deps.readdir(deps.projectsDir);
+      const flags = await Promise.all(all.map(async (d) => {
+        try { return (await deps.stat(deps.join(deps.projectsDir, d))).isDirectory(); }
+        catch { return false; }
+      }));
+      return all.filter((_, i) => flags[i]);
     } catch {
       set.status = 500;
       return null;
     }
   }
 
+  // Scan every session file once (concurrently, cached). Returns per-file usage
+  // tagged with agent name; both endpoints aggregate from this.
+  async function collectUsages(set: { status?: number }): Promise<ScannedFile[] | null> {
+    const now = Date.now();
+    if (scanCache && now - scanCache.ts < SCAN_TTL_MS) return scanCache.data;
+
+    const dirs = await projectDirs(set);
+    if (!dirs) return null;
+
+    const targets: { filePath: string; agentName: string }[] = [];
+    for (const dir of dirs) {
+      const dirPath = deps.join(deps.projectsDir, dir);
+      let files: string[];
+      try { files = (await deps.readdir(dirPath)).filter((f) => f.endsWith(".jsonl")); }
+      catch { continue; }
+      const agentName = agentNameFromDir(dir);
+      for (const file of files) targets.push({ filePath: deps.join(dirPath, file), agentName });
+    }
+
+    const scanned = await mapPool(targets, 8, async ({ filePath, agentName }) => {
+      let st: { mtimeMs?: number; size?: number } | null = null;
+      try { st = await deps.stat(filePath); } catch { /* file vanished mid-scan */ }
+      const mtimeMs = st?.mtimeMs;
+      const size = st?.size;
+
+      let usage: SessionUsage | null;
+      const cached = (mtimeMs !== undefined && size !== undefined) ? fileCache.get(filePath) : undefined;
+      if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+        usage = cached.usage; // unchanged since last scan — skip the (re)read
+      } else {
+        usage = await scanSessionWithDeps(filePath);
+        if (mtimeMs !== undefined && size !== undefined) fileCache.set(filePath, { mtimeMs, size, usage });
+      }
+      return usage ? { agentName, usage } : null;
+    });
+    const data = scanned.filter((x): x is ScannedFile => x !== null);
+    scanCache = { data, ts: now };
+    return data;
+  }
+
   const api = new Elysia();
 
-  api.get("/costs/daily", ({ query, set }) => {
+  api.get("/costs/daily", async ({ query, set }) => {
     const days = Number(query.days ?? 7);
     if (isNaN(days) || days < 1 || days > 365) {
       set.status = 400;
@@ -251,22 +218,13 @@ export function createCostsApi(deps: CostsApiDeps = {
     const buckets = makeBuckets(days);
     const bucketIndex = new Map(buckets.map((b, i) => [b, i]));
 
-    const dirs = projectDirs(set);
-    if (!dirs) return { error: "Cannot read ~/.claude/projects/" };
+    const scanned = await collectUsages(set);
+    if (!scanned) return { error: "Cannot read ~/.claude/projects/" };
 
     // agentName → { costs: number[], hadActivity: boolean[] }
     const agentDailyMap = new Map<string, { costs: number[]; hadActivity: boolean[] }>();
 
-    for (const dir of dirs) {
-      const dirPath = deps.join(deps.projectsDir, dir);
-      let files: string[];
-      try {
-        files = deps.readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
-      } catch { continue; }
-
-      if (files.length === 0) continue;
-      const agentName = agentNameFromDir(dir);
-
+    for (const { agentName, usage } of scanned) {
       if (!agentDailyMap.has(agentName)) {
         agentDailyMap.set(agentName, {
           costs: Array(days).fill(0),
@@ -276,17 +234,13 @@ export function createCostsApi(deps: CostsApiDeps = {
 
       const entry = agentDailyMap.get(agentName)!;
 
-      for (const file of files) {
-        const usage = scanSessionWithDeps(deps.join(dirPath, file));
-        if (!usage || !usage.lastTimestamp) continue;
+      if (!usage.lastTimestamp) continue;
+      const dateStr = localDateStr(usage.lastTimestamp);
+      const idx = bucketIndex.get(dateStr);
+      if (idx === undefined) continue; // outside the window
 
-        const dateStr = localDateStr(usage.lastTimestamp);
-        const idx = bucketIndex.get(dateStr);
-        if (idx === undefined) continue; // outside the window
-
-        entry.costs[idx] += estimateCost(usage);
-        entry.hadActivity[idx] = true;
-      }
+      entry.costs[idx] += estimateCost(usage);
+      entry.hadActivity[idx] = true;
     }
 
     const agents = [...agentDailyMap.entries()]
@@ -303,9 +257,9 @@ export function createCostsApi(deps: CostsApiDeps = {
     return { window: days, buckets, agents, total: { cost: totalCost, agents: agents.length } };
   });
 
-  api.get("/costs", ({ set }) => {
-    const dirs = projectDirs(set);
-    if (!dirs) return { error: "Cannot read ~/.claude/projects/" };
+  api.get("/costs", async ({ set }) => {
+    const scanned = await collectUsages(set);
+    if (!scanned) return { error: "Cannot read ~/.claude/projects/" };
 
     const agents: Record<string, {
       name: string;
@@ -321,16 +275,7 @@ export function createCostsApi(deps: CostsApiDeps = {
       lastActive: string;
     }> = {};
 
-    for (const dir of dirs) {
-      const dirPath = deps.join(deps.projectsDir, dir);
-      let files: string[];
-      try {
-        files = deps.readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
-      } catch { continue; }
-
-      if (files.length === 0) continue;
-      const agentName = agentNameFromDir(dir);
-
+    for (const { agentName, usage } of scanned) {
       if (!agents[agentName]) {
         agents[agentName] = {
           name: agentName,
@@ -347,25 +292,20 @@ export function createCostsApi(deps: CostsApiDeps = {
         };
       }
 
-      for (const file of files) {
-        const usage = scanSessionWithDeps(deps.join(dirPath, file));
-        if (!usage) continue;
+      const a = agents[agentName];
+      a.inputTokens += usage.inputTokens;
+      a.outputTokens += usage.outputTokens;
+      a.cacheReadTokens += usage.cacheReadTokens;
+      a.cacheCreateTokens += usage.cacheCreateTokens;
+      a.totalTokens += usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreateTokens;
+      a.estimatedCost += estimateCost(usage);
+      a.sessions++;
+      a.turns += usage.turns;
 
-        const a = agents[agentName];
-        a.inputTokens += usage.inputTokens;
-        a.outputTokens += usage.outputTokens;
-        a.cacheReadTokens += usage.cacheReadTokens;
-        a.cacheCreateTokens += usage.cacheCreateTokens;
-        a.totalTokens += usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreateTokens;
-        a.estimatedCost += estimateCost(usage);
-        a.sessions++;
-        a.turns += usage.turns;
+      const tier = modelTier(usage.model);
+      a.models[tier] = (a.models[tier] || 0) + usage.turns;
 
-        const tier = modelTier(usage.model);
-        a.models[tier] = (a.models[tier] || 0) + usage.turns;
-
-        if (usage.lastTimestamp > a.lastActive) a.lastActive = usage.lastTimestamp;
-      }
+      if (usage.lastTimestamp > a.lastActive) a.lastActive = usage.lastTimestamp;
     }
 
     const agentList = Object.values(agents)
@@ -383,6 +323,47 @@ export function createCostsApi(deps: CostsApiDeps = {
   });
 
   return api;
+}
+
+/** Yield control back to the event loop so a large parse never freezes serve. */
+const yieldToLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
+
+async function scanSessionContent(lines: AsyncIterable<string>): Promise<SessionUsage | null> {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreateTokens = 0;
+  let turns = 0;
+  let model = "";
+  let lastTimestamp = "";
+
+  let seen = 0;
+  for await (const line of lines) {
+    // Periodically hand the event loop back so websockets/keystrokes stay
+    // responsive while a big transcript is being scanned.
+    if ((++seen & 2047) === 0) await yieldToLoop();
+
+    // Cheap pre-filter: only usage-bearing assistant lines matter, so skip the
+    // JSON.parse for the (vast majority of) lines that can't contribute.
+    if (!line || line.indexOf('"usage"') === -1) continue;
+
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj.type !== "assistant" || !obj.message?.usage) continue;
+
+    const u = obj.message.usage;
+    inputTokens += u.input_tokens || 0;
+    outputTokens += u.output_tokens || 0;
+    cacheReadTokens += u.cache_read_input_tokens || 0;
+    cacheCreateTokens += u.cache_creation_input_tokens || 0;
+    turns++;
+
+    if (obj.message.model && !model) model = obj.message.model;
+    if (obj.timestamp) lastTimestamp = obj.timestamp;
+  }
+
+  if (turns === 0) return null;
+  return { inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, turns, model, lastTimestamp };
 }
 
 export const costsApi = createCostsApi();
