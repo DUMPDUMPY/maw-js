@@ -1,5 +1,5 @@
 import { Elysia} from "elysia";
-import { readdirSync, readFileSync, statSync } from "fs";
+import { closeSync, openSync, readSync, readdirSync, readFileSync, statSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -80,6 +80,82 @@ export interface CostsApiDeps {
   readFileSync: typeof readFileSync;
   statSync: typeof statSync;
   join: typeof join;
+  /** Read bytes [start, end) of a file. Defaults to a real fs range read. */
+  readRange?: (filePath: string, start: number, end: number) => Buffer;
+}
+
+/** One parsed session file, kept warm across polls. */
+interface FileCacheEntry {
+  mtimeMs: number;
+  size: number;
+  /** Bytes already folded into `acc`; always ends on a line boundary. */
+  offset: number;
+  acc: SessionUsage;
+  usage: SessionUsage | null;
+}
+
+/** Session JSONL files must stay under this many warm entries. */
+const FILE_CACHE_LIMIT = 4096;
+
+function emptyUsage(): SessionUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreateTokens: 0,
+    turns: 0,
+    model: "",
+    lastTimestamp: "",
+  };
+}
+
+/** Aggregate an already-parsed file. `null` when the file holds no assistant turns. */
+function toUsage(acc: SessionUsage): SessionUsage | null {
+  return acc.turns > 0 ? { ...acc } : null;
+}
+
+function defaultReadRange(filePath: string, start: number, end: number): Buffer {
+  const length = end - start;
+  if (length <= 0) return Buffer.alloc(0);
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    let filled = 0;
+    while (filled < length) {
+      const read = readSync(fd, buffer, filled, length - filled, start + filled);
+      if (read <= 0) break;
+      filled += read;
+    }
+    return filled === length ? buffer : buffer.subarray(0, filled);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Split a chunk into the complete trailing lines plus the bytes they occupy. */
+function completeLines(chunk: Buffer): { text: string; consumed: number } {
+  const lastNewline = chunk.lastIndexOf(0x0a);
+  if (lastNewline < 0) return { text: "", consumed: 0 };
+  return { text: chunk.subarray(0, lastNewline + 1).toString("utf-8"), consumed: lastNewline + 1 };
+}
+
+function accumulateUsage(content: string, acc: SessionUsage): void {
+  for (const line of content.split("\n")) {
+    if (!line) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj.type !== "assistant" || !obj.message?.usage) continue;
+
+    const u = obj.message.usage;
+    acc.inputTokens += u.input_tokens || 0;
+    acc.outputTokens += u.output_tokens || 0;
+    acc.cacheReadTokens += u.cache_read_input_tokens || 0;
+    acc.cacheCreateTokens += u.cache_creation_input_tokens || 0;
+    acc.turns++;
+
+    if (obj.message.model && !acc.model) acc.model = obj.message.model;
+    if (obj.timestamp) acc.lastTimestamp = obj.timestamp;
+  }
 }
 
 export function createCostsApi(deps: CostsApiDeps = {
@@ -89,13 +165,67 @@ export function createCostsApi(deps: CostsApiDeps = {
   statSync,
   join,
 }) {
-  function scanSessionWithDeps(filePath: string): SessionUsage | null {
+  const readRange = deps.readRange ?? defaultReadRange;
+  // Warm-scan cache. Session JSONL files are append-only and can pass 250 MB,
+  // so re-reading all of them on every /costs poll blocked the serve event loop
+  // for seconds. Each entry stores the parsed totals plus the byte offset
+  // already consumed; a poll then only parses newly appended lines.
+  const fileCache = new Map<string, FileCacheEntry>();
+
+  function storeEntry(
+    filePath: string,
+    mtimeMs: number,
+    size: number,
+    offset: number,
+    acc: SessionUsage,
+  ): SessionUsage | null {
+    const usage = toUsage(acc);
+    if (fileCache.size >= FILE_CACHE_LIMIT) fileCache.clear();
+    fileCache.set(filePath, { mtimeMs, size, offset, acc, usage });
+    return usage;
+  }
+
+  function scanSessionFresh(filePath: string, mtimeMs?: number, size?: number): SessionUsage | null {
+    let content: string;
     try {
-      const content = deps.readFileSync(filePath, "utf-8");
-      return scanSessionContent(String(content));
+      content = String(deps.readFileSync(filePath, "utf-8"));
     } catch {
       return null;
     }
+    const acc = emptyUsage();
+    accumulateUsage(content, acc);
+    // No usable stat identity (test doubles) — parse fresh, never cache.
+    if (mtimeMs === undefined || size === undefined) return toUsage(acc);
+
+    const tail = content.slice(content.lastIndexOf("\n") + 1);
+    const offset = size - Buffer.byteLength(tail, "utf-8");
+    return storeEntry(filePath, mtimeMs, size, offset, acc);
+  }
+
+  function scanSessionWithDeps(filePath: string): SessionUsage | null {
+    let stat: { size?: number; mtimeMs?: number };
+    try {
+      stat = deps.statSync(filePath) as unknown as { size?: number; mtimeMs?: number };
+    } catch {
+      return null;
+    }
+    const size = Number(stat?.size);
+    const mtimeMs = Number(stat?.mtimeMs);
+    if (!Number.isFinite(size) || !Number.isFinite(mtimeMs)) return scanSessionFresh(filePath);
+
+    const cached = fileCache.get(filePath);
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs) return cached.usage;
+
+    // Append-only fast path: parse just the new tail of a file we already read.
+    if (cached && size > cached.offset) {
+      try {
+        const { text, consumed } = completeLines(readRange(filePath, cached.offset, size));
+        const acc = { ...cached.acc };
+        accumulateUsage(text, acc);
+        return storeEntry(filePath, mtimeMs, size, cached.offset + consumed, acc);
+      } catch { /* fall back to a full read below */ }
+    }
+    return scanSessionFresh(filePath, mtimeMs, size);
   }
 
   function projectDirs(set: { status?: number }) {
@@ -253,37 +383,6 @@ export function createCostsApi(deps: CostsApiDeps = {
   });
 
   return api;
-}
-
-function scanSessionContent(content: string): SessionUsage | null {
-  const lines = content.split("\n").filter(Boolean);
-
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreateTokens = 0;
-  let turns = 0;
-  let model = "";
-  let lastTimestamp = "";
-
-  for (const line of lines) {
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { continue; }
-    if (obj.type !== "assistant" || !obj.message?.usage) continue;
-
-    const u = obj.message.usage;
-    inputTokens += u.input_tokens || 0;
-    outputTokens += u.output_tokens || 0;
-    cacheReadTokens += u.cache_read_input_tokens || 0;
-    cacheCreateTokens += u.cache_creation_input_tokens || 0;
-    turns++;
-
-    if (obj.message.model && !model) model = obj.message.model;
-    if (obj.timestamp) lastTimestamp = obj.timestamp;
-  }
-
-  if (turns === 0) return null;
-  return { inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, turns, model, lastTimestamp };
 }
 
 export const costsApi = createCostsApi();
